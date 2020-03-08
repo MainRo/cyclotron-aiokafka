@@ -11,6 +11,19 @@ Welcome to Cyclotron AioKafka's documentation!
    :caption: Contents:
 
 
+.. marble::
+    :alt: Consumer
+
+      +--1-2-3-->
+         +-11-12-13-->
+            +-21-22-23-->
+    --+--+--+----------->
+
+    [ application ]
+
+    -+------------->
+     +a-b-c-|
+
 
 Indices and tables
 ==================
