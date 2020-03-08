@@ -1,0 +1,8 @@
+*.pyc
+.ropeproject
+.tox
+*.egg-info
+build
+dist
+.vscode
+_build
