@@ -2,7 +2,8 @@ import traceback
 import asyncio
 from collections import namedtuple
 
-from rx import Observable
+import rx
+import rx.operators as ops
 from rx.disposable import Disposable
 from cyclotron import Component
 
@@ -17,27 +18,25 @@ Source = namedtuple('Source', ['response'])
 # Sink items
 Consumer = namedtuple('Consumer', ['server', 'topics'])
 Consumer.__doc__ += ": Creates a consumer client that can subscribe to multiple topics"
-Consumer.id.__doc__ += ": Id of the consumer"
 Consumer.server.__doc__ += ": Address of the boostrap server"
 Consumer.topics.__doc__ += ": Observable emitting ConsumerTopic items"
 
 Producer = namedtuple('Producer', ['server', 'topics', 'acks'])
 Producer.__new__.__defaults__ = (1,)
 Producer.__doc__ += ": Creates a producer client that can publish to pultiple topics"
-Producer.id.__doc__ += ": Id of the producer"
 Producer.server.__doc__ += ": Address of the boostrap server"
 Producer.topics.__doc__ += ": Observable emitting ProducerTopic items"
 Producer.acks.__doc__ += ": Records acknowledgement strategy, as documented in aiokafka"
 
 ConsumerTopic = namedtuple('ConsumerTopic', ['topic', 'group'])
-Topc.__new__.__defaults__ = (None,)
+ConsumerTopic.__new__.__defaults__ = (None,)
 
 ProducerTopic = namedtuple('ProducerTopic', ['topic', 'records', 'key_mapper'])
-Topc.__new__.__defaults__ = (None,)
+ProducerTopic.__new__.__defaults__ = (None,)
 
 
 # Source items
-ConsumerRecords = namedtuple('ConsumerRecords': ['topic', 'records'])
+ConsumerRecords = namedtuple('ConsumerRecords', ['topic', 'records'])
 
 
 def choose_partition(key, partitions):
@@ -153,7 +152,7 @@ def run_producer(loop, source_observer, server, topics, acks):
             topic.records.pipe(
                 ops.map(lambda i: (
                     topic.topic, 
-                    topic.key_mapper(i) is key_mapper is not None else None,
+                    topic.key_mapper(i) if key_mapper is not None else None,
                     i
                 ))
             )
@@ -169,7 +168,7 @@ def make_driver(loop=None):
         def on_subscribe(observer, scheduler):
             def on_next(i):
                 if type(i) is Consumer:
-                    run_consumer(loop, observer, i.server, i.topics):
+                    run_consumer(loop, observer, i.server, i.topics)
                 elif type(i) is Producer:
                     run_producer(loop, observer, i.server, i.topics, i.acks)
                 else:
@@ -181,7 +180,7 @@ def make_driver(loop=None):
                 on_error=observer.on_error,
             )
         return Source(
-            response=Observable.create(on_subscribe),
+            response=rx.create(on_subscribe),
         )
     
     return Component(call=driver, input=Sink)
