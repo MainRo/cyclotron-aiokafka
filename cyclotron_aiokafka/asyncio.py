@@ -23,7 +23,7 @@ async def to_agen(obs, loop):
             queue.task_done()
         elif isinstance(i, OnError):
             disposable.dispose()
-            raise(Exception(i.value))
+            raise(Exception(i.exception))
         else:
             disposable.dispose()
             break
