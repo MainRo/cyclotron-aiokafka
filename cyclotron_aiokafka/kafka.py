@@ -7,7 +7,7 @@ import rx.operators as ops
 from rx.disposable import Disposable
 from cyclotron import Component
 
-from.asyncio import to_agen
+from .asyncio import to_agen
 
 from kafka.partitioner.hashed import murmur2
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -46,58 +46,74 @@ def choose_partition(key, partitions):
     return partitions[idx]
 
 
-async def send_record(producer, topic, key, value, partition_bytes):
+async def send_record(client, topic, key, value, partition_bytes):
     try:
-        partitions = await producer.client.partitions_for(topic)
-        partition = choose_partition(partition_bytes, list(partitions))
+        partitions = await client.partitions_for(topic)
+        partition = choose_partition(key, list(partitions))
 
-        fut = await producer.client.send(
+        fut = await client.send(
             topic, key=key, value=value, partition=partition)
+        '''
         producer.pending_records.append(fut)
         if len(producer.pending_records) > 20000:
             pending_records = producer.pending_records.copy()
             producer.pending_records = []
             await asyncio.gather(*pending_records)
+        '''
 
     except Exception as e:
         print("exception: {}, {}".format(
             e, traceback.print_tb(e.__traceback__)),
-            level=logging.ERROR)
+        )
 
 
 def run_consumer(loop, source_observer, server, topics):
     async def _run_consumer(topic_queue):
         clients = {}
-        while True:
-            if len(clients) == 0 or not topic_queue.empty():
-                cmd = await topic_queue.get()
-                if cmd[0] == 'add':
-                    client = AIOKafkaConsumer(
-                        cmd[1],
-                        loop=loop,
-                        bootstrap_servers=server,
-                        group_id=cmd[2])
-                    await client.start()
-                    if cmd[3] in clients:
-                        source_observer.on_error(ValueError("topic already subscribed for this consumer: {}".format(cmd[3])))
+        try:
+            while True:
+                if len(clients) == 0 or not topic_queue.empty():
+                    cmd = await topic_queue.get()
+                    if cmd[0] == 'add':
+                        print('run consumer: add')
+                        client = AIOKafkaConsumer(
+                            cmd[1],
+                            loop=loop,
+                            bootstrap_servers=server,
+                            group_id=cmd[2],
+                            auto_offset_reset='earliest')
+                        await client.start()
+                        print("started")
+                        if cmd[3] in clients:
+                            source_observer.on_error(ValueError("topic already subscribed for this consumer: {}".format(cmd[3])))
+                        else:
+                            clients[cmd[3]] = client
+                    elif cmd[0] == 'del':
+                        print('run consumer: del')
+                        client = clients.pop(cmd[1], None)
+                        if client is not None:
+                            await client.stop()
+                            cmd[1].on_completed()
                     else:
-                        clients[cmd[3]] = client
-                elif cmd[0] == 'del':
-                    client = clients.pop(cmd[1], None)
-                    if client is not None:
-                        await client.close()
-                        cmd[1].on_completed()
-                else:
-                    source_observer.on_error(TypeError("invalid type for queue command: {}".format(cmd)))
+                        source_observer.on_error(TypeError("invalid type for queue command: {}".format(cmd)))
 
 
-            if len(clients) == 0:
-                break
+                if len(clients) == 0:
+                    print("no client")
+                    break
 
-            for observer, client in clients.items():
-                break # take first entry for now
-            msg = await client.getone()
-            observer.on_next(msg)
+                for observer, client in clients.items():
+                    break # take first entry for now
+                print("selected client")
+                msg = await client.getone()
+                print("msg")
+                observer.on_next(msg)
+
+        except asyncio.CancelledError as e:
+            print("cancelled {}".format(e))
+        except Exception as e:
+            print(e)
+
 
 
     topic_queue = asyncio.Queue()
@@ -107,7 +123,9 @@ def run_consumer(loop, source_observer, server, topics):
      create observable, and stopped on disposal
     '''
     def on_next(i):
+        print("consumer topic: {}".format(i))
         def on_subscribe(observer, scheduler):
+            print("topic subscribe")
             def dispose():
                 topic_queue.put_nowait(('del', observer))
 
@@ -118,11 +136,13 @@ def run_consumer(loop, source_observer, server, topics):
             topic=i.topic,
             records=rx.create(on_subscribe)))
 
-    loop.create_task(_run_consumer(topic_queue))
+    task = loop.create_task(_run_consumer(topic_queue))
     topics.subscribe(
         on_next=on_next,
         on_error=source_observer.on_error
     )
+
+    return task
 
 
 def run_producer(loop, source_observer, server, topics, acks):
@@ -133,9 +153,11 @@ def run_producer(loop, source_observer, server, topics, acks):
             acks=acks)
         #pending_records = []
 
-        await producer.start()
+        await client.start()
         gen = to_agen(records, loop)
-        async for record in records:
+        print("started producer")
+        async for record in gen:
+            print("record: {}".format(record))
             await send_record(client, record[0], record[1], record[2], None)
             '''
             pending_records.append(fut)
@@ -152,7 +174,7 @@ def run_producer(loop, source_observer, server, topics, acks):
             topic.records.pipe(
                 ops.map(lambda i: (
                     topic.topic, 
-                    topic.key_mapper(i) if key_mapper is not None else None,
+                    topic.key_mapper(i),
                     i
                 ))
             )
@@ -166,15 +188,20 @@ def make_driver(loop=None):
 
     def driver(sink):
         def on_subscribe(observer, scheduler):
+            consumer_tasks = []
             def on_next(i):
                 if type(i) is Consumer:
-                    run_consumer(loop, observer, i.server, i.topics)
+                    print("consumer: {}".format(i))
+                    task = run_consumer(loop, observer, i.server, i.topics)
+                    consumer_tasks.append(task)
                 elif type(i) is Producer:
                     run_producer(loop, observer, i.server, i.topics, i.acks)
                 else:
                     e = "Unknown item type: {}".format(i)
                     print(e)
                     observer.on_error(TypeError(e))
+
+            print("driver kafka subscribe")
             return sink.request.subscribe(
                 on_next=on_next,
                 on_error=observer.on_error,
