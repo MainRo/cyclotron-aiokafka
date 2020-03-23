@@ -1,0 +1,3 @@
+rx>=3.0
+cyclotron>=1.0
+aiokafka>=0.5
