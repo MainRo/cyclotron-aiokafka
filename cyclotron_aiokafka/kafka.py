@@ -51,7 +51,7 @@ async def send_record(client, topic, key, value, partition_bytes):
         partitions = await client.partitions_for(topic)
         partition = choose_partition(key, list(partitions))
 
-        fut = await client.send(
+        await client.send(
             topic, key=key, value=value, partition=partition)
         '''
         producer.pending_records.append(fut)
@@ -85,7 +85,8 @@ def run_consumer(loop, source_observer, server, topics):
                         await client.start()
                         print("started")
                         if cmd[3] in clients:
-                            source_observer.on_error(ValueError("topic already subscribed for this consumer: {}".format(cmd[3])))
+                            source_observer.on_error(ValueError(
+                                "topic already subscribed for this consumer: {}".format(cmd[3])))
                         else:
                             clients[cmd[3]] = client
                     elif cmd[0] == 'del':
@@ -95,15 +96,15 @@ def run_consumer(loop, source_observer, server, topics):
                             await client.stop()
                             cmd[1].on_completed()
                     else:
-                        source_observer.on_error(TypeError("invalid type for queue command: {}".format(cmd)))
-
+                        source_observer.on_error(TypeError(
+                            "invalid type for queue command: {}".format(cmd)))
 
                 if len(clients) == 0:
                     print("no client")
                     break
 
                 for observer, client in clients.items():
-                    break # take first entry for now
+                    break  # take first entry for now
                 print("selected client")
                 msg = await client.getone()
                 print("msg")
@@ -114,12 +115,10 @@ def run_consumer(loop, source_observer, server, topics):
         except Exception as e:
             print(e)
 
-
-
     topic_queue = asyncio.Queue()
     ''' for each topic consumer request, send a new ConsumerRecords on driver
      source, and forward the request to the consumer scheduler coroutine.
-     The kafka consumer is stated when the application subscribes to the 
+     The kafka consumer is stated when the application subscribes to the
      create observable, and stopped on disposal
     '''
     def on_next(i):
@@ -151,7 +150,7 @@ def run_producer(loop, source_observer, server, topics, acks):
             loop=loop,
             bootstrap_servers=server,
             acks=acks)
-        #pending_records = []
+        # pending_records = []
 
         await client.start()
         gen = to_agen(records, loop)
@@ -170,15 +169,14 @@ def run_producer(loop, source_observer, server, topics, acks):
         await client.stop()
 
     records = topics.pipe(
-        ops.flat_map(lambda topic: 
-            topic.records.pipe(
-                ops.map(lambda i: (
-                    topic.topic, 
-                    topic.key_mapper(i),
-                    i
-                ))
-            )
-    ))
+        ops.flat_map(lambda topic: topic.records.pipe(
+            ops.map(lambda i: (
+                topic.topic,
+                topic.key_mapper(i),
+                i
+            ))
+        ))
+    )
 
     loop.create_task(_run_producer(records))
 
@@ -189,6 +187,7 @@ def make_driver(loop=None):
     def driver(sink):
         def on_subscribe(observer, scheduler):
             consumer_tasks = []
+
             def on_next(i):
                 if type(i) is Consumer:
                     print("consumer: {}".format(i))
@@ -209,5 +208,5 @@ def make_driver(loop=None):
         return Source(
             response=rx.create(on_subscribe),
         )
-    
+
     return Component(call=driver, input=Sink)
