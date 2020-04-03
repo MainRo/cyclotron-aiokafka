@@ -1,3 +1,4 @@
+import functools
 import traceback
 import asyncio
 from collections import namedtuple
@@ -28,11 +29,8 @@ Producer.server.__doc__ += ": Address of the boostrap server"
 Producer.topics.__doc__ += ": Observable emitting ProducerTopic items"
 Producer.acks.__doc__ += ": Records acknowledgement strategy, as documented in aiokafka"
 
-ConsumerTopic = namedtuple('ConsumerTopic', ['topic', 'group'])
-ConsumerTopic.__new__.__defaults__ = (None,)
-
-ProducerTopic = namedtuple('ProducerTopic', ['topic', 'records', 'key_mapper'])
-ProducerTopic.__new__.__defaults__ = (None,)
+ConsumerTopic = namedtuple('ConsumerTopic', ['topic', 'group', 'decode'])
+ProducerTopic = namedtuple('ProducerTopic', ['topic', 'records', 'map_key', 'encode', 'map_partition'])
 
 
 # Source items
@@ -40,16 +38,19 @@ ConsumerRecords = namedtuple('ConsumerRecords', ['topic', 'records'])
 
 
 def choose_partition(key, partitions):
-    idx = murmur2(key)
-    idx &= 0x7fffffff
+    if type(key) == int:
+        idx = key
+    else:
+        idx = murmur2(key)
+        idx &= 0x7fffffff
     idx %= len(partitions)
     return partitions[idx]
 
 
-async def send_record(client, topic, key, value, partition_bytes):
+async def send_record(client, topic, key, value, partition_key):
     try:
         partitions = await client.partitions_for(topic)
-        partition = choose_partition(key, list(partitions))
+        partition = choose_partition(partition_key, list(partitions))
 
         await client.send(
             topic, key=key, value=value, partition=partition)
@@ -70,6 +71,7 @@ async def send_record(client, topic, key, value, partition_bytes):
 def run_consumer(loop, source_observer, server, topics):
     async def _run_consumer(topic_queue):
         clients = {}
+        decode = {}
         try:
             while True:
                 if len(clients) == 0 or not topic_queue.empty():
@@ -84,11 +86,12 @@ def run_consumer(loop, source_observer, server, topics):
                             auto_offset_reset='earliest')
                         await client.start()
                         print("started")
-                        if cmd[3] in clients:
+                        if cmd[4] in clients:
                             source_observer.on_error(ValueError(
                                 "topic already subscribed for this consumer: {}".format(cmd[3])))
                         else:
-                            clients[cmd[3]] = client
+                            clients[cmd[4]] = client
+                            decode[cmd[4]] = cmd[3]
                     elif cmd[0] == 'del':
                         print('run consumer: del')
                         client = clients.pop(cmd[1], None)
@@ -105,9 +108,9 @@ def run_consumer(loop, source_observer, server, topics):
 
                 for observer, client in clients.items():
                     break  # take first entry for now
-                print("selected client")
+                await asyncio.sleep(0)
                 msg = await client.getone()
-                print("msg")
+                msg = decode[observer](msg.value)
                 observer.on_next(msg)
 
         except asyncio.CancelledError as e:
@@ -123,17 +126,18 @@ def run_consumer(loop, source_observer, server, topics):
     '''
     def on_next(i):
         print("consumer topic: {}".format(i))
-        def on_subscribe(observer, scheduler):
+        def on_subscribe(decode, observer, scheduler):
             print("topic subscribe")
             def dispose():
                 topic_queue.put_nowait(('del', observer))
 
-            topic_queue.put_nowait(('add', i.topic, i.group, observer))
+            topic_queue.put_nowait(('add', i.topic, i.group, decode, observer))
             return Disposable(dispose)
 
+        print(i)
         source_observer.on_next(ConsumerRecords(
             topic=i.topic,
-            records=rx.create(on_subscribe)))
+            records=rx.create(functools.partial(on_subscribe, i.decode))))
 
     task = loop.create_task(_run_consumer(topic_queue))
     topics.subscribe(
@@ -156,8 +160,8 @@ def run_producer(loop, source_observer, server, topics, acks):
         gen = to_agen(records, loop)
         print("started producer")
         async for record in gen:
-            print("record: {}".format(record))
-            await send_record(client, record[0], record[1], record[2], None)
+            #print("record: {}".format(record))
+            await send_record(client, record[0], record[1], record[2], record[3])
             '''
             pending_records.append(fut)
             if len(pending_records) > 20000:
@@ -172,8 +176,9 @@ def run_producer(loop, source_observer, server, topics, acks):
         ops.flat_map(lambda topic: topic.records.pipe(
             ops.map(lambda i: (
                 topic.topic,
-                topic.key_mapper(i),
-                i
+                topic.map_key(i),
+                topic.encode(i),
+                topic.map_partition(i),
             ))
         ))
     )
