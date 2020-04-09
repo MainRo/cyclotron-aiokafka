@@ -17,7 +17,10 @@ async def to_agen(obs, loop):
     )
 
     while True:
-        i = await queue.get()
+        try:
+            i = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            i = await queue.get()
         if isinstance(i, OnNext):
             yield i.value
             queue.task_done()

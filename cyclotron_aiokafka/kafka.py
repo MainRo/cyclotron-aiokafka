@@ -7,6 +7,7 @@ import rx
 import rx.operators as ops
 from rx.disposable import Disposable
 from cyclotron import Component
+from cyclotron.debug import trace_observable
 
 from .asyncio import to_agen
 
@@ -52,15 +53,12 @@ async def send_record(client, topic, key, value, partition_key):
         partitions = await client.partitions_for(topic)
         partition = choose_partition(partition_key, list(partitions))
 
-        await client.send(
+        fut = await client.send(
+        #await client.send(
             topic, key=key, value=value, partition=partition)
-        '''
-        producer.pending_records.append(fut)
-        if len(producer.pending_records) > 20000:
-            pending_records = producer.pending_records.copy()
-            producer.pending_records = []
-            await asyncio.gather(*pending_records)
-        '''
+
+        return fut
+
 
     except Exception as e:
         print("exception: {}, {}".format(
@@ -154,23 +152,30 @@ def run_producer(loop, source_observer, server, topics, acks):
             loop=loop,
             bootstrap_servers=server,
             acks=acks)
-        # pending_records = []
+        pending_records = []
 
         await client.start()
         gen = to_agen(records, loop)
         print("started producer")
         async for record in gen:
             #print("record: {}".format(record))
-            await send_record(client, record[0], record[1], record[2], record[3])
-            '''
+            fut = await send_record(client, record[0], record[1], record[2], record[3])
+
             pending_records.append(fut)
-            if len(pending_records) > 20000:
+            if len(pending_records) > 10000:
                 _pending_records = pending_records.copy()
                 pending_records = []
                 await asyncio.gather(*_pending_records)
-            '''
 
+        # flush pending writes on completion
+        print("producer completed")
+        _pending_records = pending_records.copy()
+        pending_records = []
+        await asyncio.gather(*_pending_records)
+
+        await client.flush()
         await client.stop()
+        print("producer closed")
 
     records = topics.pipe(
         ops.flat_map(lambda topic: topic.records.pipe(
@@ -179,7 +184,7 @@ def run_producer(loop, source_observer, server, topics, acks):
                 topic.map_key(i),
                 topic.encode(i),
                 topic.map_partition(i),
-            ))
+            )),
         ))
     )
 
