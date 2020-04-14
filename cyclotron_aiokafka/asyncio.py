@@ -1,15 +1,23 @@
 import asyncio
-import rx
 import rx.operators as ops
-from rx.core.notification import OnNext, OnError, OnCompleted
+from rx.core.notification import OnNext, OnError
 from rx.scheduler.eventloop import AsyncIOScheduler
 
 
-async def to_agen(obs, loop):
+async def to_agen(obs, loop, get_feedback_observer):
     queue = asyncio.Queue()
+    index = 0
 
     def on_next(i):
+        nonlocal index
         queue.put_nowait(i)
+        if isinstance(i, OnNext):
+            index += 1
+            if index == 500:
+                index = 0
+                obv = get_feedback_observer()
+                if obv is not None:
+                    obv.on_next((i.value[0], queue.qsize()))  # todo: mapper
 
     disposable = obs.pipe(ops.materialize()).subscribe(
         on_next=on_next,
@@ -21,6 +29,7 @@ async def to_agen(obs, loop):
             i = queue.get_nowait()
         except asyncio.QueueEmpty:
             i = await queue.get()
+
         if isinstance(i, OnNext):
             yield i.value
             queue.task_done()

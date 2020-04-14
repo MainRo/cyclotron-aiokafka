@@ -15,7 +15,7 @@ from kafka.partitioner.hashed import murmur2
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 Sink = namedtuple('Sink', ['request'])
-Source = namedtuple('Source', ['response'])
+Source = namedtuple('Source', ['response', 'feedback'])
 
 # Sink items
 Consumer = namedtuple('Consumer', ['server', 'topics'])
@@ -30,9 +30,9 @@ Producer.server.__doc__ += ": Address of the boostrap server"
 Producer.topics.__doc__ += ": Observable emitting ProducerTopic items"
 Producer.acks.__doc__ += ": Records acknowledgement strategy, as documented in aiokafka"
 
-ConsumerTopic = namedtuple('ConsumerTopic', ['topic', 'group', 'decode'])
+ConsumerTopic = namedtuple('ConsumerTopic', ['topic', 'group', 'decode', 'control'])
+ConsumerTopic.__new__.__defaults__ = (None,)
 ProducerTopic = namedtuple('ProducerTopic', ['topic', 'records', 'map_key', 'encode', 'map_partition'])
-
 
 # Source items
 ConsumerRecords = namedtuple('ConsumerRecords', ['topic', 'records'])
@@ -59,7 +59,6 @@ async def send_record(client, topic, key, value, partition_key):
 
         return fut
 
-
     except Exception as e:
         print("exception: {}, {}".format(
             e, traceback.print_tb(e.__traceback__)),
@@ -70,6 +69,14 @@ def run_consumer(loop, source_observer, server, topics):
     async def _run_consumer(topic_queue):
         clients = {}
         decode = {}
+        control = {}
+        control_dispose = {}
+
+        def on_next_control(obv, i):
+            nonlocal control
+            control[obv] = i
+            print("on_next_control: {}".format(i))
+
         try:
             while True:
                 if len(clients) == 0 or not topic_queue.empty():
@@ -83,6 +90,12 @@ def run_consumer(loop, source_observer, server, topics):
                             group_id=cmd[2],
                             auto_offset_reset='earliest')
                         await client.start()
+
+                        if cmd[5] is not None:
+                            control_dispose[cmd[4]] = cmd[5].subscribe(
+                                on_next=functools.partial(on_next_control, cmd[4]),
+                                on_error=source_observer.on_error,
+                            )
                         print("started")
                         if cmd[4] in clients:
                             source_observer.on_error(ValueError(
@@ -92,6 +105,10 @@ def run_consumer(loop, source_observer, server, topics):
                             decode[cmd[4]] = cmd[3]
                     elif cmd[0] == 'del':
                         print('run consumer: del')
+                        dispose = control_dispose.pop(cmd[1], None)
+                        if dispose is not None:
+                            dispose()
+
                         client = clients.pop(cmd[1], None)
                         if client is not None:
                             await client.stop()
@@ -106,7 +123,10 @@ def run_consumer(loop, source_observer, server, topics):
 
                 for observer, client in clients.items():
                     break  # take first entry for now
-                await asyncio.sleep(0)
+                if observer in control:
+                    await asyncio.sleep(control[observer])
+                else:
+                    await asyncio.sleep(0)
                 msg = await client.getone()
                 msg = decode[observer](msg.value)
                 observer.on_next(msg)
@@ -124,12 +144,14 @@ def run_consumer(loop, source_observer, server, topics):
     '''
     def on_next(i):
         print("consumer topic: {}".format(i))
+
         def on_subscribe(decode, observer, scheduler):
             print("topic subscribe")
+
             def dispose():
                 topic_queue.put_nowait(('del', observer))
 
-            topic_queue.put_nowait(('add', i.topic, i.group, decode, observer))
+            topic_queue.put_nowait(('add', i.topic, i.group, decode, observer, i.control))
             return Disposable(dispose)
 
         print(i)
@@ -146,7 +168,7 @@ def run_consumer(loop, source_observer, server, topics):
     return task
 
 
-def run_producer(loop, source_observer, server, topics, acks):
+def run_producer(loop, source_observer, server, topics, acks, get_feedback_observer):
     async def _run_producer(records):
         client = AIOKafkaProducer(
             loop=loop,
@@ -155,7 +177,7 @@ def run_producer(loop, source_observer, server, topics, acks):
         pending_records = []
 
         await client.start()
-        gen = to_agen(records, loop)
+        gen = to_agen(records, loop, get_feedback_observer)
         print("started producer")
         async for record in gen:
             #print("record: {}".format(record))
@@ -195,6 +217,20 @@ def make_driver(loop=None):
     loop = loop or asyncio.get_event_loop()
 
     def driver(sink):
+        feedback_observer = None
+
+        def get_feedback_observer():
+            return feedback_observer
+
+        def on_feedback_subscribe(observer, scheduler):
+            def dispose():
+                nonlocal feedback_observer
+                feedback_observer = None
+
+            nonlocal feedback_observer
+            feedback_observer = observer
+            return Disposable(dispose)
+
         def on_subscribe(observer, scheduler):
             consumer_tasks = []
 
@@ -204,7 +240,7 @@ def make_driver(loop=None):
                     task = run_consumer(loop, observer, i.server, i.topics)
                     consumer_tasks.append(task)
                 elif type(i) is Producer:
-                    run_producer(loop, observer, i.server, i.topics, i.acks)
+                    run_producer(loop, observer, i.server, i.topics, i.acks, get_feedback_observer)
                 else:
                     e = "Unknown item type: {}".format(i)
                     print(e)
@@ -217,6 +253,7 @@ def make_driver(loop=None):
             )
         return Source(
             response=rx.create(on_subscribe),
+            feedback=rx.create(on_feedback_subscribe),
         )
 
     return Component(call=driver, input=Sink)
