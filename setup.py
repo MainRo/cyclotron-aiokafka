@@ -17,7 +17,7 @@ python_requires = '>=3.6'
 install_requires = [
     'rx>=3.0',
     'cyclotron>=1.0',
-    'aiokafka>=0.5',
+    'aiokafka>=0.6',
 ]
 
 setup(

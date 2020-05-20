@@ -11,7 +11,7 @@ from cyclotron.debug import trace_observable
 
 from .asyncio import to_agen
 
-from kafka.partitioner.hashed import murmur2
+from kafka.partitioner import murmur2
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 Sink = namedtuple('Sink', ['request'])
