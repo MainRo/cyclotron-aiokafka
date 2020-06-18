@@ -12,17 +12,18 @@ from cyclotron.debug import trace_observable
 from .asyncio import to_agen
 
 from kafka.partitioner import murmur2
+import aiokafka
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 Sink = namedtuple('Sink', ['request'])
 Source = namedtuple('Source', ['response', 'feedback'])
 
 # Sink items
-Consumer = namedtuple('Consumer', ['server', 'topics', 'max_partition_fetch_bytes'])
+Consumer = namedtuple('Consumer', ['server', 'topics', 'group', 'max_partition_fetch_bytes'])
 Consumer.__doc__ += ": Creates a consumer client that can subscribe to multiple topics"
 Consumer.server.__doc__ += ": Address of the boostrap server"
 Consumer.topics.__doc__ += ": Observable emitting ConsumerTopic items"
-Consumer.__new__.__defaults__ = (1, 1048576)
+Consumer.__new__.__defaults__ = (1048576,)
 
 Producer = namedtuple('Producer', ['server', 'topics', 'acks', 'max_request_size'])
 Producer.__new__.__defaults__ = (1, 1048576)
@@ -31,7 +32,7 @@ Producer.server.__doc__ += ": Address of the boostrap server"
 Producer.topics.__doc__ += ": Observable emitting ProducerTopic items"
 Producer.acks.__doc__ += ": Records acknowledgement strategy, as documented in aiokafka"
 
-ConsumerTopic = namedtuple('ConsumerTopic', ['topic', 'group', 'decode', 'control', 'start_from'])
+ConsumerTopic = namedtuple('ConsumerTopic', ['topic', 'decode', 'control', 'start_from'])
 ConsumerTopic.__new__.__defaults__ = (None, 'end')
 ProducerTopic = namedtuple('ProducerTopic', ['topic', 'records', 'map_key', 'encode', 'map_partition'])
 
@@ -66,27 +67,20 @@ async def send_record(client, topic, key, value, partition_key):
         )
 
 
-ConsumerDelCmd = namedtuple('ConsumerDelCmd', ['observer'])
-ConsumerAddCmd = namedtuple('ConsumerAddCmd', ['observer', 'consumer'])
+DelConsumerCmd = namedtuple('DelConsumerCmd', ['observer'])
+AddConsumerCmd = namedtuple('AddConsumerCmd', ['observer', 'consumer'])
 ConsumerProperties = namedtuple('ConsumerProperties', [
-    'client', 'observer',
-    'topic', 'group', 'decode',
-    'commit_last'
+    'observer', 'topic', 'decode', 'start_from'
 ])
 
-commit_strategy = {
-    'end': ('latest', True),
-    'begining': ('latest', False),
-    'last': ('latest', False),
-}
 
-
-def run_consumer(loop, source_observer, server, topics):
+def run_consumer(loop, source_observer, server, group, topics):
     async def _run_consumer(topic_queue):
-        clients = {}
+        consumers = {}
         #decode = {}
         control = {}
         control_dispose = {}
+        topic_last_offset = {}
 
         def on_next_control(obv, i):
             nonlocal control
@@ -94,21 +88,26 @@ def run_consumer(loop, source_observer, server, topics):
             print("on_next_control: {}".format(i))
 
         try:
+            client = AIOKafkaConsumer(
+                loop=loop,
+                bootstrap_servers=server,
+                group_id=group,
+                auto_offset_reset='earliest',
+                enable_auto_commit=False
+            )
+            await client.start()
+
             while True:
-                if len(clients) == 0 or not topic_queue.empty():
+                if len(consumers) == 0 or not topic_queue.empty():
                     cmd = await topic_queue.get()
-                    if type(cmd) is ConsumerAddCmd:
-                        auto_offset_reset, enable_auto_commit = commit_strategy[cmd.consumer.start_from]
+                    if type(cmd) is AddConsumerCmd:
                         print('run consumer: add {}'.format(cmd.consumer.topic))
-                        client = AIOKafkaConsumer(
-                            cmd.consumer.topic,
-                            loop=loop,
-                            bootstrap_servers=server,
-                            group_id=cmd.consumer.group,
-                            auto_offset_reset=auto_offset_reset,
-                            enable_auto_commit=enable_auto_commit
-                        )
-                        await client.start()
+
+                        if cmd.observer in consumers:
+                            source_observer.on_error(ValueError(
+                                "topic already subscribed for this consumer: {}".format(cmd.consumer.decode))
+                            )
+                            break
 
                         if cmd.consumer.control is not None:
                             control_dispose[cmd.observer] = cmd.consumer.control.subscribe(
@@ -116,49 +115,67 @@ def run_consumer(loop, source_observer, server, topics):
                                 on_error=source_observer.on_error,
                             )
                         print("started")
-                        if cmd.observer in clients:
-                            source_observer.on_error(ValueError(
-                                "topic already subscribed for this consumer: {}".format(cmd.consumer.decode))
-                            )
-                        else:
-                            clients[cmd.observer] = ConsumerProperties(
-                                client=client, observer=cmd.observer,
-                                topic=cmd.consumer.topic, group=cmd.consumer.group, decode=cmd.consumer.decode,
-                                commit_last=cmd.consumer.start_from == 'last',
-                            )
-                    elif type(cmd) is ConsumerDelCmd:
+
+                        consumers[cmd.observer] = ConsumerProperties(
+                            observer=cmd.observer,
+                            topic=cmd.consumer.topic, decode=cmd.consumer.decode,
+                            start_from=cmd.consumer.start_from,
+                        )
+                        topic_list = set([t[1].topic for t in consumers.items()])
+                        client.subscribe(topics=topic_list)
+
+                    elif type(cmd) is DelConsumerCmd:
                         print('run consumer: del')
                         dispose = control_dispose.pop(cmd.observer, None)
                         if dispose is not None:
                             dispose()
 
-                        client = clients.pop(cmd.observer, None)
-                        if client is not None:
-                            await client.client.stop()
+                        consumer = consumers.pop(cmd.observer, None)
+                        if consumer is not None:
+                            topic_list = set([t[1].topic for t in consumers.items()])
+                            client.subscribe(topics=topic_list)
                             cmd.observer.on_completed()
                     else:
                         source_observer.on_error(TypeError(
                             "invalid type for queue command: {}".format(cmd)))
 
-                if len(clients) == 0:
-                    print("no client")
+                if len(consumers) == 0:
+                    print("no consumer")
                     break
 
-                for observer, client in clients.items():
-                    break  # take first entry for now
-                if observer in control:
-                    await asyncio.sleep(control[observer])
-                else:
-                    await asyncio.sleep(0)
+                regulated = False
+                for observer, consumer in consumers.items():                    
+                    if observer in control:
+                        await asyncio.sleep(control[observer])
+                        regulated = True
+                        break  # limitation only one controllable topic for now
+                
+                if regulated is False:
+                    await asyncio.sleep(0)                    
 
-                if client.commit_last is True:
-                    await client.client.commit()
+                #if client.commit_last is True:
+                #    await client.client.commit()
 
-                msg = await client.client.getone()
-                print(type(msg.value))
-                msg = client.decode(msg.value)
-                print(type(msg))
-                observer.on_next(msg)
+                print("wait next")
+                msg = await client.getone()
+                start_from = None
+                for observer, consumer in consumers.items():
+                    if consumer.topic == msg.topic:
+                        start_from = consumer.start_from
+                        print(type(msg.value))
+                        decoded_msg = consumer.decode(msg.value)
+                        print(type(decoded_msg))
+                        observer.on_next(decoded_msg)
+
+                tp = aiokafka.TopicPartition(msg.topic, msg.partition)
+                if start_from == 'end':                    
+                    await client.commit({tp: msg.offset + 1})
+                elif start_from == 'last':
+                    if msg.topic in topic_last_offset:
+                        await client.commit(topic_last_offset[msg.topic])
+                        topic_last_offset[msg.topic] = {tp: msg.offset + 1}
+
+            await client.stop()
 
         except asyncio.CancelledError as e:
             print("cancelled {}".format(e))
@@ -175,9 +192,9 @@ def run_consumer(loop, source_observer, server, topics):
         print("topic subscribe: {}".format(i))
 
         def dispose():
-            topic_queue.put_nowait(ConsumerDelCmd(observer))
+            topic_queue.put_nowait(DelConsumerCmd(observer))
 
-        topic_queue.put_nowait(ConsumerAddCmd(observer, i))
+        topic_queue.put_nowait(AddConsumerCmd(observer, i))
         return Disposable(dispose)
 
     def on_next(i):
@@ -265,7 +282,7 @@ def make_driver(loop=None):
             def on_next(i):
                 if type(i) is Consumer:
                     print("consumer: {}".format(i))
-                    task = run_consumer(loop, observer, i.server, i.topics)
+                    task = run_consumer(loop, observer, i.server, i.group, i.topics)
                     consumer_tasks.append(task)
                 elif type(i) is Producer:
                     run_producer(
