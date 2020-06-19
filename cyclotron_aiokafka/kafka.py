@@ -153,7 +153,6 @@ def run_consumer(loop, source_observer, server, group, topics):
                 if regulated is False:
                     await asyncio.sleep(0)                    
 
-                print("wait next")
                 msg = await client.getone()
                 start_from = None
                 for observer, consumer in consumers.items():
