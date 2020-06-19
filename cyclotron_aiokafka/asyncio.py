@@ -21,6 +21,7 @@ async def to_agen(obs, loop, get_feedback_observer):
 
     disposable = obs.pipe(ops.materialize()).subscribe(
         on_next=on_next,
+        on_error=lambda e: print("to_agen error: {}".format(e)),
         scheduler=AsyncIOScheduler(loop=loop)
     )
 

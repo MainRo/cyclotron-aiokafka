@@ -153,18 +153,13 @@ def run_consumer(loop, source_observer, server, group, topics):
                 if regulated is False:
                     await asyncio.sleep(0)                    
 
-                #if client.commit_last is True:
-                #    await client.client.commit()
-
                 print("wait next")
                 msg = await client.getone()
                 start_from = None
                 for observer, consumer in consumers.items():
                     if consumer.topic == msg.topic:
                         start_from = consumer.start_from
-                        print(type(msg.value))
                         decoded_msg = consumer.decode(msg.value)
-                        print(type(decoded_msg))
                         observer.on_next(decoded_msg)
 
                 tp = aiokafka.TopicPartition(msg.topic, msg.partition)
