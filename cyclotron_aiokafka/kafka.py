@@ -77,7 +77,6 @@ ConsumerProperties = namedtuple('ConsumerProperties', [
 def run_consumer(loop, source_observer, server, group, topics):
     async def _run_consumer(topic_queue):
         consumers = {}
-        #decode = {}
         control = {}
         control_dispose = {}
         topic_last_offset = {}
@@ -125,7 +124,6 @@ def run_consumer(loop, source_observer, server, group, topics):
                         client.subscribe(topics=topic_list)
 
                     elif type(cmd) is DelConsumerCmd:
-                        print('run consumer: del')
                         dispose = control_dispose.pop(cmd.observer, None)
                         if dispose is not None:
                             dispose()
@@ -133,7 +131,8 @@ def run_consumer(loop, source_observer, server, group, topics):
                         consumer = consumers.pop(cmd.observer, None)
                         if consumer is not None:
                             topic_list = set([t[1].topic for t in consumers.items()])
-                            client.subscribe(topics=topic_list)
+                            if len(topic_list) > 0:
+                                client.subscribe(topics=topic_list)
                             cmd.observer.on_completed()
                     else:
                         source_observer.on_error(TypeError(
