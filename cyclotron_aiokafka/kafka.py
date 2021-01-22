@@ -10,6 +10,7 @@ from cyclotron import Component
 from cyclotron.debug import trace_observable
 
 from .asyncio import to_agen
+from .consumer import ConsumerRebalancer
 
 from kafka.partitioner import murmur2
 import aiokafka
@@ -79,7 +80,6 @@ def run_consumer(loop, source_observer, server, group, topics):
         consumers = {}
         control = {}
         control_dispose = {}
-        topic_last_offset = {}
 
         def on_next_control(obv, i):
             nonlocal control
@@ -91,11 +91,13 @@ def run_consumer(loop, source_observer, server, group, topics):
                 loop=loop,
                 bootstrap_servers=server,
                 group_id=group,
-                auto_offset_reset='earliest',
-                enable_auto_commit=False
+                auto_offset_reset='none',
+                enable_auto_commit=True,
             )
+            print("start kafka consumer")
             await client.start()
 
+            yield_countdown = 5000
             while True:
                 if len(consumers) == 0 or not topic_queue.empty():
                     cmd = await topic_queue.get()
@@ -120,8 +122,13 @@ def run_consumer(loop, source_observer, server, group, topics):
                             topic=cmd.consumer.topic, decode=cmd.consumer.decode,
                             start_from=cmd.consumer.start_from,
                         )
-                        topic_list = set([t[1].topic for t in consumers.items()])
-                        client.subscribe(topics=topic_list)
+                        start_positions = {}
+                        topics = []
+                        for c in consumers.items():
+                            topics.append(c[1].topic)
+                            start_positions[c[1].topic] = c[1].start_from
+                        topics = set(topics)
+                        client.subscribe(topics=topics, listener=ConsumerRebalancer(client, start_positions))
 
                     elif type(cmd) is DelConsumerCmd:
                         dispose = control_dispose.pop(cmd.observer, None)
@@ -130,9 +137,14 @@ def run_consumer(loop, source_observer, server, group, topics):
 
                         consumer = consumers.pop(cmd.observer, None)
                         if consumer is not None:
-                            topic_list = set([t[1].topic for t in consumers.items()])
-                            if len(topic_list) > 0:
-                                client.subscribe(topics=topic_list)
+                            start_positions = {}
+                            topics = []
+                            for c in consumers.items():
+                                topics.append(c[1].topic)
+                                start_positions[c[1].topic] = c[1].start_from
+                            topics = set(topics)
+                            if len(topics) > 0:
+                                client.subscribe(topics=topics, listener=ConsumerRebalancer(client, start_positions))
                             cmd.observer.on_completed()
                     else:
                         source_observer.on_error(TypeError(
@@ -147,26 +159,19 @@ def run_consumer(loop, source_observer, server, group, topics):
                     if observer in control:
                         await asyncio.sleep(control[observer])
                         regulated = True
+                        yield_countdown = 5000
                         break  # limitation only one controllable topic for now
                 
-                if regulated is False:
-                    await asyncio.sleep(0)                    
+                yield_countdown -= 1
+                if yield_countdown == 0 and regulated is False:
+                    await asyncio.sleep(0)
+                    yield_countdown = 5000
 
                 msg = await client.getone()
-                start_from = None
                 for observer, consumer in consumers.items():
                     if consumer.topic == msg.topic:
-                        start_from = consumer.start_from
                         decoded_msg = consumer.decode(msg.value)
                         observer.on_next(decoded_msg)
-
-                tp = aiokafka.TopicPartition(msg.topic, msg.partition)
-                if start_from == 'end':                    
-                    await client.commit({tp: msg.offset + 1})
-                elif start_from == 'last':
-                    if msg.topic in topic_last_offset:
-                        await client.commit(topic_last_offset[msg.topic])
-                        topic_last_offset[msg.topic] = {tp: msg.offset + 1}
 
             await client.stop()
 
