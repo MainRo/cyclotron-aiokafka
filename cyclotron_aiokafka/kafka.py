@@ -91,7 +91,7 @@ def run_consumer(loop, source_observer, server, group, topics):
                 loop=loop,
                 bootstrap_servers=server,
                 group_id=group,
-                auto_offset_reset='none',
+                auto_offset_reset='latest',
                 enable_auto_commit=True,
             )
             print("start kafka consumer")
