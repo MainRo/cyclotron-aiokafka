@@ -19,12 +19,15 @@ on_partitions_assigned: {TopicPartition(topic='bench1_feature', partition=1), To
 '''
 class ConsumerRebalancer(aiokafka.ConsumerRebalanceListener):
 
-    def __init__(self, client, start_positions):
+    def __init__(self, client, start_positions, on_revoked, on_assigned):
         self.client = client # leak on cyclic reference ?
         self.start_positions = start_positions
+        self.on_revoked = on_revoked
+        self.on_assigned = on_assigned
 
     async def on_partitions_revoked(self, revoked):
         print("on_partitions_revoked: {}".format(revoked))
+        self.on_revoked(revoked)
 
     async def on_partitions_assigned(self, assigned):
         print("on_partitions_assigned: {}".format(assigned))
@@ -43,3 +46,5 @@ class ConsumerRebalancer(aiokafka.ConsumerRebalanceListener):
         if len(seek_to_end_partitions) > 0:
             print("seeking these partition to end offet: {}".format(seek_to_end_partitions))
             await self.client.seek_to_end(*seek_to_end_partitions)
+
+        self.on_assigned(assigned)

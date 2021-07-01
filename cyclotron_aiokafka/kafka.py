@@ -15,16 +15,17 @@ from .consumer import ConsumerRebalancer
 from kafka.partitioner import murmur2
 import aiokafka
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka.structs import TopicPartition
 
 Sink = namedtuple('Sink', ['request'])
 Source = namedtuple('Source', ['response', 'feedback'])
 
 # Sink items
-Consumer = namedtuple('Consumer', ['server', 'topics', 'group', 'max_partition_fetch_bytes'])
+Consumer = namedtuple('Consumer', ['server', 'topics', 'group', 'max_partition_fetch_bytes', 'mode'])
 Consumer.__doc__ += ": Creates a consumer client that can subscribe to multiple topics"
 Consumer.server.__doc__ += ": Address of the boostrap server"
 Consumer.topics.__doc__ += ": Observable emitting ConsumerTopic items"
-Consumer.__new__.__defaults__ = (1048576,)
+Consumer.__new__.__defaults__ = (1048576, "streaming")
 
 Producer = namedtuple('Producer', ['server', 'topics', 'acks', 'max_request_size'])
 Producer.__new__.__defaults__ = (1, 1048576)
@@ -68,23 +69,87 @@ async def send_record(client, topic, key, value, partition_key):
         )
 
 
-DelConsumerCmd = namedtuple('DelConsumerCmd', ['observer'])
+DelConsumerCmd = namedtuple('DelConsumerCmd', ['topic'])
 AddConsumerCmd = namedtuple('AddConsumerCmd', ['observer', 'consumer'])
-ConsumerProperties = namedtuple('ConsumerProperties', [
-    'observer', 'topic', 'decode', 'start_from'
+PullTopicPartitionCmd = namedtuple('PullTopicPartition', ['topic_partition', 'count'])
+TopicContext = namedtuple('ConsumerProperties', [
+    'observer', 'topic', 'decode', 'start_from', 'partitions',
 ])
 
+class TopicPartitionContext(object):
+    def __init__(self):
+        self.tp = None
+        self.observer = None
+        self.completed = False
 
-def run_consumer(loop, source_observer, server, group, topics):
+
+def run_consumer(loop, source_observer, server, group, topics, batch_mode):
+    topic_queue = asyncio.Queue()
+
+    def on_partition_back(tp_context, i):
+        topic_queue.put_nowait(PullTopicPartitionCmd(tp_context, i))
+
     async def _run_consumer(topic_queue):
-        consumers = {}
         control = {}
         control_dispose = {}
+        topics = {} # context of each subscribed topic
 
         def on_next_control(obv, i):
             nonlocal control
             control[obv] = i
             print("on_next_control: {}".format(i))
+
+        def on_partition_subscribe(tp_context, observer, scheduler):
+            tp_context.observer = observer
+            observer.on_next(functools.partial(on_partition_back, tp_context.tp))
+
+        def on_revoked(tps):
+            for tp in tps:
+                topics[tp.topic].partitions[tp].observer.on_completed()
+                topics[tp.topic].partitions.clear()
+
+        def on_assigned(tps):
+            for tp in tps:
+                context = TopicPartitionContext()
+                context.tp = tp
+                topics[tp.topic].partitions[tp] = context
+                topics[tp.topic].observer.on_next(
+                    rx.create(functools.partial(on_partition_subscribe, context))
+                )
+            print("on assigned completed")
+
+        async def tp_is_completed(topic_partition):
+            if batch_mode is True:
+                highwater = client.highwater(topic_partition)
+                if highwater:
+                    position = await client.position(topic_partition)
+                    if highwater == position:
+                        print("no more lag on {}-{}".format(topic_partition.topic, topic_partition.partition))
+                        topics[topic_partition.topic].partitions[topic_partition].completed = True
+                        return True
+            return False
+
+        async def process_next_batch(topic_partition, count):
+            tp = [topic_partition] if topic_partition else []
+            read_count = 0
+            if count == 1:
+                msg = await client.getone(*tp)
+                topic = topics[topic_partition.topic]
+
+                decoded_msg = topic.decode(msg.value)
+                topic.partitions[topic_partition].observer.on_next(decoded_msg)
+                read_count += 1
+            else:
+                data = await client.getmany(*tp, timeout_ms=5000, max_records=count)
+                if len(data) > 0:
+                    msgs = data[topic_partition]
+                    topic = topics[topic_partition.topic]
+                    for msg in msgs:
+                        decoded_msg = topic.decode(msg.value)
+                        topic.partitions[topic_partition].observer.on_next(decoded_msg)
+                        read_count += 1
+
+            return read_count
 
         try:
             client = AIOKafkaConsumer(
@@ -98,66 +163,93 @@ def run_consumer(loop, source_observer, server, group, topics):
             await client.start()
 
             yield_countdown = 5000
+            prev_partition = None
+            pcount = 0
             while True:
-                if len(consumers) == 0 or not topic_queue.empty():
+                try:
+                    cmd = topic_queue.get_nowait()
+                except asyncio.QueueEmpty as e:
+                    print("queue empty")
                     cmd = await topic_queue.get()
-                    if type(cmd) is AddConsumerCmd:
-                        print('run consumer: add {}'.format(cmd.consumer.topic))
 
-                        if cmd.observer in consumers:
-                            source_observer.on_error(ValueError(
-                                "topic already subscribed for this consumer: {}".format(cmd.consumer.decode))
-                            )
-                            break
+                #if len(topics) == 0 or not topic_queue.empty():
+                #cmd = await topic_queue.get()
+                if type(cmd) is AddConsumerCmd:
+                    print('run consumer: add {}'.format(cmd.consumer.topic))
 
-                        if cmd.consumer.control is not None:
-                            control_dispose[cmd.observer] = cmd.consumer.control.subscribe(
-                                on_next=functools.partial(on_next_control, cmd.observer),
-                                on_error=source_observer.on_error,
-                            )
-                        print("started")
-
-                        consumers[cmd.observer] = ConsumerProperties(
-                            observer=cmd.observer,
-                            topic=cmd.consumer.topic, decode=cmd.consumer.decode,
-                            start_from=cmd.consumer.start_from,
+                    if cmd.consumer.topic in topics:
+                        source_observer.on_error(ValueError(
+                            "topic already subscribed for this consumer: {}".format(cmd.consumer.decode))
                         )
-                        start_positions = {}
-                        topics = []
-                        for c in consumers.items():
-                            topics.append(c[1].topic)
-                            start_positions[c[1].topic] = c[1].start_from
-                        topics = set(topics)
-                        client.subscribe(topics=topics, listener=ConsumerRebalancer(client, start_positions))
+                        break
 
-                    elif type(cmd) is DelConsumerCmd:
-                        dispose = control_dispose.pop(cmd.observer, None)
-                        if dispose is not None:
-                            dispose()
+                    if cmd.consumer.control is not None:
+                        control_dispose[cmd.observer] = cmd.consumer.control.subscribe(
+                            on_next=functools.partial(on_next_control, cmd.observer),
+                            on_error=source_observer.on_error,
+                        )
 
-                        consumer = consumers.pop(cmd.observer, None)
-                        if consumer is not None:
-                            start_positions = {}
-                            topics = []
-                            for c in consumers.items():
-                                topics.append(c[1].topic)
-                                start_positions[c[1].topic] = c[1].start_from
-                            topics = set(topics)
-                            if len(topics) > 0:
-                                client.subscribe(topics=topics, listener=ConsumerRebalancer(client, start_positions))
-                            cmd.observer.on_completed()
-                    else:
-                        source_observer.on_error(TypeError(
-                            "invalid type for queue command: {}".format(cmd)))
+                    topics[cmd.consumer.topic] = TopicContext(
+                        observer=cmd.observer,
+                        topic=cmd.consumer.topic, decode=cmd.consumer.decode,
+                        start_from=cmd.consumer.start_from,
+                        partitions={}
+                    )
+                    sub_start_positions = {}
+                    sub_topics = []
+                    for k, c in topics.items():
+                        sub_topics.append(c.topic)
+                        sub_start_positions[c.topic] = c.start_from
+                    sub_topics = set(sub_topics)
+                    client.subscribe(topics=sub_topics, listener=ConsumerRebalancer(
+                        client, sub_start_positions,
+                        on_revoked=on_revoked,
+                        on_assigned=on_assigned,
+                    ))
 
-                if len(consumers) == 0:
-                    print("no consumer")
+                elif type(cmd) is DelConsumerCmd:
+                    print('run consumer: del {}'.format(cmd))
+                    topic = topics[cmd.topic]
+                    dispose = control_dispose.pop(topic.observer, None)
+                    if dispose is not None:
+                        dispose()
+
+                    topics.pop(cmd.topic)
+                    sub_start_positions = {}
+                    sub_topics = []
+                    for k, c in topics.items():
+                        sub_topics.append(c.topic)
+                        sub_start_positions[c.topic] = c.start_from
+                    sub_topics = set(sub_topics)
+                    if len(sub_topics) > 0:
+                        client.subscribe(topics=sub_topics, listener=ConsumerRebalancer(
+                            client, sub_start_positions,
+                            on_revoked=on_revoked,
+                            on_assigned=on_assigned,
+                        ))
+                    topic.observer.on_completed()
+                elif type(cmd) is PullTopicPartitionCmd:
+                    no_lag = await tp_is_completed(cmd.topic_partition)
+                    if no_lag == False:
+                        await process_next_batch(cmd.topic_partition, cmd.count)
+                    if batch_mode is True and no_lag == True:
+                        topic = topics[cmd.topic_partition.topic]
+                        topic.partitions[cmd.topic_partition].observer.on_completed()
+                        if all([i.completed for _, i in topic.partitions.items()]):
+                            print("completed processing topic {}".format(cmd.topic_partition.topic))
+                            topic.observer.on_completed()
+                else:
+                    source_observer.on_error(TypeError(
+                        "invalid type for queue command: {}".format(cmd)))
+
+                if len(topics) == 0:
+                    print("no more topic subscribed, ending consumer task")
                     break
 
                 regulated = False
-                for observer, consumer in consumers.items():                    
-                    if observer in control:
-                        await asyncio.sleep(control[observer])
+                for topic, consumer in topics.items():
+                    if consumer.observer in control:
+                        await asyncio.sleep(control[consumer.observer])
                         regulated = True
                         yield_countdown = 5000
                         break  # limitation only one controllable topic for now
@@ -167,44 +259,39 @@ def run_consumer(loop, source_observer, server, group, topics):
                     await asyncio.sleep(0)
                     yield_countdown = 5000
 
-                msg = await client.getone()
-                for observer, consumer in consumers.items():
-                    if consumer.topic == msg.topic:
-                        decoded_msg = consumer.decode(msg.value)
-                        observer.on_next(decoded_msg)
-
             await client.stop()
 
         except asyncio.CancelledError as e:
             print("cancelled {}".format(e))
         except Exception as e:
-            print(e)
+            print("consummer exception: {}:{}".format(type(e), e))
+            print(traceback.format_list(traceback.extract_tb(e.__traceback__)))
+            raise e
 
-    topic_queue = asyncio.Queue()
     ''' for each topic consumer request, send a new ConsumerRecords on driver
      source, and forward the request to the consumer scheduler coroutine.
      The kafka consumer is stated when the application subscribes to the
      create observable, and stopped on disposal
     '''
-    def on_subscribe(i, observer, scheduler):
+    def on_topic_subscribe(i, observer, scheduler):
         print("topic subscribe: {}".format(i))
 
         def dispose():
-            topic_queue.put_nowait(DelConsumerCmd(observer))
+            topic_queue.put_nowait(DelConsumerCmd(i.topic))
 
         topic_queue.put_nowait(AddConsumerCmd(observer, i))
         return Disposable(dispose)
 
-    def on_next(i):
+    def on_topic_next(i):
         print("consumer topic: {}".format(i))
         source_observer.on_next(ConsumerRecords(
             topic=i.topic,
-            records=rx.create(functools.partial(on_subscribe, i))))
+            records=rx.create(functools.partial(on_topic_subscribe, i))))
 
     task = loop.create_task(_run_consumer(topic_queue))
     topics.subscribe(
-        on_next=on_next,
-        on_error=source_observer.on_error
+        on_next=on_topic_next,
+        on_error=source_observer.on_error,
     )
 
     return task
@@ -223,7 +310,6 @@ def run_producer(loop, source_observer, server, topics, acks, max_request_size, 
         gen = to_agen(records, loop, get_feedback_observer)
         print("started producer")
         async for record in gen:
-            #print("record: {}".format(record))
             fut = await send_record(client, record[0], record[1], record[2], record[3])
 
             pending_records.append(fut)
@@ -279,8 +365,8 @@ def make_driver(loop=None):
 
             def on_next(i):
                 if type(i) is Consumer:
-                    print("consumer: {}".format(i))
-                    task = run_consumer(loop, observer, i.server, i.group, i.topics)
+                    print("starting consumer: {}".format(i))
+                    task = run_consumer(loop, observer, i.server, i.group, i.topics, i.mode == 'batch')
                     consumer_tasks.append(task)
                 elif type(i) is Producer:
                     run_producer(
