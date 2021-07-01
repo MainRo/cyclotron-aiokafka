@@ -1,4 +1,5 @@
 import functools
+from enum import Enum
 import traceback
 import asyncio
 from collections import namedtuple
@@ -17,15 +18,19 @@ import aiokafka
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import TopicPartition
 
+
+DataFeedMode = Enum('DataFeedMode', ['PUSH', 'PULL'])
+DataSourceType = Enum('DataFeedMode', ['STREAM', 'BATCH'])
+
 Sink = namedtuple('Sink', ['request'])
 Source = namedtuple('Source', ['response', 'feedback'])
 
 # Sink items
-Consumer = namedtuple('Consumer', ['server', 'topics', 'group', 'max_partition_fetch_bytes', 'mode'])
+Consumer = namedtuple('Consumer', ['server', 'topics', 'group', 'max_partition_fetch_bytes', 'source_type', 'feed_mode'])
 Consumer.__doc__ += ": Creates a consumer client that can subscribe to multiple topics"
 Consumer.server.__doc__ += ": Address of the boostrap server"
 Consumer.topics.__doc__ += ": Observable emitting ConsumerTopic items"
-Consumer.__new__.__defaults__ = (1048576, "streaming")
+Consumer.__new__.__defaults__ = (1048576, DataSourceType.STREAM, DataFeedMode.PUSH)
 
 Producer = namedtuple('Producer', ['server', 'topics', 'acks', 'max_request_size'])
 Producer.__new__.__defaults__ = (1, 1048576)
@@ -72,9 +77,12 @@ async def send_record(client, topic, key, value, partition_key):
 DelConsumerCmd = namedtuple('DelConsumerCmd', ['topic'])
 AddConsumerCmd = namedtuple('AddConsumerCmd', ['observer', 'consumer'])
 PullTopicPartitionCmd = namedtuple('PullTopicPartition', ['topic_partition', 'count'])
+PushRecordCmd = namedtuple('PushRecordCmd', [])
 TopicContext = namedtuple('ConsumerProperties', [
     'observer', 'topic', 'decode', 'start_from', 'partitions',
 ])
+AssignedCmd = namedtuple('AssignedCmd', [])
+RevokedCmd = namedtuple('RevokedCmd', [])
 
 class TopicPartitionContext(object):
     def __init__(self):
@@ -83,7 +91,7 @@ class TopicPartitionContext(object):
         self.completed = False
 
 
-def run_consumer(loop, source_observer, server, group, topics, batch_mode):
+def run_consumer(loop, source_observer, server, group, topics, source_type, feed_mode):
     topic_queue = asyncio.Queue()
 
     def on_partition_back(tp_context, i):
@@ -101,12 +109,14 @@ def run_consumer(loop, source_observer, server, group, topics, batch_mode):
 
         def on_partition_subscribe(tp_context, observer, scheduler):
             tp_context.observer = observer
-            observer.on_next(functools.partial(on_partition_back, tp_context.tp))
+            if feed_mode is DataFeedMode.PULL:
+                observer.on_next(functools.partial(on_partition_back, tp_context.tp))
 
         def on_revoked(tps):
             for tp in tps:
                 topics[tp.topic].partitions[tp].observer.on_completed()
                 topics[tp.topic].partitions.clear()
+            topic_queue.put_nowait(RevokedCmd())
 
         def on_assigned(tps):
             for tp in tps:
@@ -116,10 +126,11 @@ def run_consumer(loop, source_observer, server, group, topics, batch_mode):
                 topics[tp.topic].observer.on_next(
                     rx.create(functools.partial(on_partition_subscribe, context))
                 )
-            print("on assigned completed")
+
+            topic_queue.put_nowait(AssignedCmd())
 
         async def tp_is_completed(topic_partition):
-            if batch_mode is True:
+            if source_type is DataSourceType.BATCH:
                 highwater = client.highwater(topic_partition)
                 if highwater:
                     position = await client.position(topic_partition)
@@ -134,6 +145,8 @@ def run_consumer(loop, source_observer, server, group, topics, batch_mode):
             read_count = 0
             if count == 1:
                 msg = await client.getone(*tp)
+                if topic_partition is None:
+                    topic_partition = TopicPartition(msg.topic, msg.partition)
                 topic = topics[topic_partition.topic]
 
                 decoded_msg = topic.decode(msg.value)
@@ -162,6 +175,7 @@ def run_consumer(loop, source_observer, server, group, topics, batch_mode):
             print("start kafka consumer")
             await client.start()
 
+            partition_assigned = False
             yield_countdown = 5000
             prev_partition = None
             pcount = 0
@@ -230,14 +244,25 @@ def run_consumer(loop, source_observer, server, group, topics, batch_mode):
                     topic.observer.on_completed()
                 elif type(cmd) is PullTopicPartitionCmd:
                     no_lag = await tp_is_completed(cmd.topic_partition)
-                    if no_lag == False:
-                        await process_next_batch(cmd.topic_partition, cmd.count)
-                    if batch_mode is True and no_lag == True:
+                    if source_type is DataSourceType.BATCH and no_lag == True:
                         topic = topics[cmd.topic_partition.topic]
                         topic.partitions[cmd.topic_partition].observer.on_completed()
                         if all([i.completed for _, i in topic.partitions.items()]):
                             print("completed processing topic {}".format(cmd.topic_partition.topic))
                             topic.observer.on_completed()
+                    else:
+                        await process_next_batch(cmd.topic_partition, cmd.count)
+                elif type(cmd) is PushRecordCmd:
+                    read_count = await process_next_batch(None, 1)
+                    if read_count > 0:
+                        topic_queue.put_nowait(PushRecordCmd())
+                elif type(cmd) is AssignedCmd:
+                    if partition_assigned is False:
+                        partition_assigned = True
+                        if feed_mode is DataFeedMode.PUSH:
+                            topic_queue.put_nowait(PushRecordCmd())
+                elif type(cmd) is RevokedCmd:
+                    partition_assigned = False
                 else:
                     source_observer.on_error(TypeError(
                         "invalid type for queue command: {}".format(cmd)))
@@ -366,7 +391,7 @@ def make_driver(loop=None):
             def on_next(i):
                 if type(i) is Consumer:
                     print("starting consumer: {}".format(i))
-                    task = run_consumer(loop, observer, i.server, i.group, i.topics, i.mode == 'batch')
+                    task = run_consumer(loop, observer, i.server, i.group, i.topics, i.source_type, i.feed_mode)
                     consumer_tasks.append(task)
                 elif type(i) is Producer:
                     run_producer(
