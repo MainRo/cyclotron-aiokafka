@@ -22,7 +22,7 @@ install_requires = [
 
 setup(
     name="cyclotron-aiokafka",
-    version='0.4.1',
+    version='0.5.0',
     url='https://github.com/MainRo/cyclotron-aiokafka.git',
     license='MIT',
     description="AioKafka driver for cyclotron",
