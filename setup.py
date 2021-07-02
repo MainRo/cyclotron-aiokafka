@@ -15,9 +15,9 @@ except IOError:
 
 python_requires = '>=3.6'
 install_requires = [
-    'rx>=3.0',
-    'cyclotron>=1.0',
-    'aiokafka>=0.6',
+    'rx>=3.2',
+    'cyclotron>=1.2',
+    'aiokafka>=0.7.1',
 ]
 
 setup(
