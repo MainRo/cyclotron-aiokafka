@@ -9,11 +9,10 @@ AsyncIO Kafka support for Cyclotron
     :target: https://github.com/mainro/cyclotron-aiokafka/actions?query=workflow%3A%22Python+package%22
     :alt: Github WorkFlows
 
-Key Features
-============
-
-Getting started
-===============
-
+This is a `Cyclotron <https://github.com/MainRo/cyclotron-py>`_ driver for Kafka
+producer and consumers. It is based on `AIOKafka
+<https://github.com/aio-libs/aiokafka>`_, and designed specifically for
+`makinage <https://github.com/maki-nage/makinage>`_. No doc for now as the code
+is still experimental.
 
 
