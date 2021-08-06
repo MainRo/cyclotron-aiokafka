@@ -114,9 +114,10 @@ def run_consumer(loop, source_observer, server, group, topics, source_type, feed
 
         def on_revoked(tps):
             for tp in tps:
-                topics[tp.topic].partitions[tp].observer.on_completed()
-                topics[tp.topic].partitions.clear()
-            topic_queue.put_nowait(RevokedCmd())
+                topics[tp.topic].partitions[tp.partition].observer.on_completed()
+                del topics[tp.topic].partitions[tp.partition]
+            if len(topics[tp.topic].partitions) == 0:
+                topic_queue.put_nowait(RevokedCmd())
 
         def on_assigned(tps):
             for tp in tps:
