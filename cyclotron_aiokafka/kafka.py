@@ -99,13 +99,12 @@ def run_consumer(loop, source_observer, server, group, topics, source_type, feed
 
     async def _run_consumer(topic_queue):
         control = {}
-        control_dispose = {}
+        control_disposables = {}
         topics = {} # context of each subscribed topic
 
         def on_next_control(obv, i):
             nonlocal control
             control[obv] = i
-            print("on_next_control: {}".format(i))
 
         def on_partition_subscribe(tp_context, observer, scheduler):
             tp_context.observer = observer
@@ -113,10 +112,18 @@ def run_consumer(loop, source_observer, server, group, topics, source_type, feed
                 observer.on_next(functools.partial(on_partition_back, tp_context.tp))
 
         def on_revoked(tps):
+            inactive_topics = {}
+            for topic in topics:
+                inactive_topics[topic] = False
+
             for tp in tps:
                 topics[tp.topic].partitions[tp.partition].observer.on_completed()
                 del topics[tp.topic].partitions[tp.partition]
-            if len(topics[tp.topic].partitions) == 0:
+                if len(topics[tp.topic].partitions) == 0:
+                    inactive_topics[tp.topic] == True
+
+            all_inactive = [inactive_topics[s] for s in inactive_topics]
+            if all(all_inactive):
                 topic_queue.put_nowait(RevokedCmd())
 
         def on_assigned(tps):
@@ -199,7 +206,7 @@ def run_consumer(loop, source_observer, server, group, topics, source_type, feed
                         break
 
                     if cmd.consumer.control is not None:
-                        control_dispose[cmd.observer] = cmd.consumer.control.subscribe(
+                        control_disposables[cmd.observer] = cmd.consumer.control.subscribe(
                             on_next=functools.partial(on_next_control, cmd.observer),
                             on_error=source_observer.on_error,
                         )
@@ -225,9 +232,9 @@ def run_consumer(loop, source_observer, server, group, topics, source_type, feed
                 elif type(cmd) is DelConsumerCmd:
                     print('run consumer: del {}'.format(cmd))
                     topic = topics[cmd.topic]
-                    dispose = control_dispose.pop(topic.observer, None)
-                    if dispose is not None:
-                        dispose()
+                    disposable = control_disposables.pop(topic.observer, None)
+                    if disposable is not None:
+                        disposable.dispose()
 
                     topics.pop(cmd.topic)
                     sub_start_positions = {}
@@ -274,10 +281,12 @@ def run_consumer(loop, source_observer, server, group, topics, source_type, feed
 
                 regulated = False
                 for topic, consumer in topics.items():
-                    if consumer.observer in control:
-                        await asyncio.sleep(control[consumer.observer])
+                    regulation_time = control.get(consumer.observer, None)
+                    if regulation_time is not None and regulation_time > 0:
+                        await asyncio.sleep(regulation_time)
                         regulated = True
                         yield_countdown = 5000
+                        control[consumer.observer] = None
                         break  # limitation only one controllable topic for now
                 
                 yield_countdown -= 1
