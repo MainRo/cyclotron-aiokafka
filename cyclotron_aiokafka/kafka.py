@@ -91,7 +91,7 @@ class TopicPartitionContext(object):
         self.completed = False
 
 
-def run_consumer(loop, source_observer, server, group, topics, source_type, feed_mode):
+def run_consumer(loop, source_observer, server, group, max_partition_fetch_bytes, topics, source_type, feed_mode):
     topic_queue = asyncio.Queue()
 
     def on_partition_back(tp_context, i):
@@ -179,6 +179,7 @@ def run_consumer(loop, source_observer, server, group, topics, source_type, feed
                 group_id=group,
                 auto_offset_reset='latest',
                 enable_auto_commit=True,
+                max_partition_fetch_bytes=max_partition_fetch_bytes,
             )
             print("start kafka consumer")
             await client.start()
@@ -401,7 +402,13 @@ def make_driver(loop=None):
             def on_next(i):
                 if type(i) is Consumer:
                     print("starting consumer: {}".format(i))
-                    task = run_consumer(loop, observer, i.server, i.group, i.topics, i.source_type, i.feed_mode)
+                    task = run_consumer(
+                        loop, observer,
+                        i.server, i.group,
+                        i.max_partition_fetch_bytes,
+                        i.topics,
+                        i.source_type, i.feed_mode
+                    )
                     consumer_tasks.append(task)
                 elif type(i) is Producer:
                     run_producer(
