@@ -4,9 +4,9 @@ import traceback
 import asyncio
 from collections import namedtuple
 
-import rx
-import rx.operators as ops
-from rx.disposable import Disposable
+import reactivex as rx
+import reactivex.operators as ops
+from reactivex.disposable import Disposable
 from cyclotron import Component
 from cyclotron.debug import trace_observable
 

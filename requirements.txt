@@ -1,3 +1,4 @@
-rx>=3.2
-cyclotron>=1.2
-aiokafka>=0.7.1
+  reactivex~=4.0
+  cyclotron~=2.0
+  aiokafka>=0.7.1
+  

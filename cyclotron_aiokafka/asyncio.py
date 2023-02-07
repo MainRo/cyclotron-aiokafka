@@ -1,7 +1,7 @@
 import asyncio
-import rx.operators as ops
-from rx.core.notification import OnNext, OnError
-from rx.scheduler.eventloop import AsyncIOScheduler
+import reactivex.operators as ops
+from reactivex.notification import OnNext, OnError
+from reactivex.scheduler.eventloop import AsyncIOScheduler
 
 
 async def to_agen(obs, loop, get_feedback_observer):

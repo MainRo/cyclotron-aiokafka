@@ -1,0 +1,32 @@
+[project]
+name = "cyclotron-aiokafka"
+version = "0.7.0"
+description = "AioKafka driver for cyclotron"
+readme = "README.rst"
+requires-python = ">=3.7"
+license = {file = "LICENSE.txt"}
+keywords = ["kafka", "reactivex", "cyclotron"]
+authors = [
+  {email = "romain.picard@oakbits.com"},
+  {name = "Romain Picard"}
+]
+classifiers = [
+  'Development Status :: 3 - Alpha',
+  'Intended Audience :: Developers',
+  'Programming Language :: Python :: 3',
+  'License :: OSI Approved :: MIT License',
+]
+
+dependencies = [
+  'reactivex~=4.0',
+  'cyclotron~=2.0',
+  'aiokafka>=0.7.1',
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+]
+
+[project.urls]
+repository = "https://github.com/MainRo/cyclotron-aiokafka.git"
